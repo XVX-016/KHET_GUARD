@@ -14,17 +14,23 @@ Author: Khet Guard ML Team
 """
 
 import os
+import csv
 import json
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms, models
-from torch.utils.tensorboard import SummaryWriter
 from torch.cuda.amp import autocast, GradScaler
 from pathlib import Path
 import numpy as np
 import logging
+from sklearn.model_selection import train_test_split
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:  # tensorboard extra not installed
+    SummaryWriter = None
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -41,11 +47,13 @@ CONFIG = {
     },
     "training": {
         "batch_size": 16,  # Reduced for GPU memory safety
-        "epochs": 5,       # Reduced for testing
+        "epochs": 6,       # Short demonstration run for Review-2
         "learning_rate": 1e-4,
         "dropout_rate": 0.3,
         "patience": 10,
-        "use_amp": True  # Enable Automatic Mixed Precision
+        "use_amp": True,  # Enable Automatic Mixed Precision
+        "num_workers": 0,  # Windows-safe
+        "seed": 42,
     },
     "output_dir": "model/exports"
 }
@@ -56,23 +64,27 @@ os.makedirs(CONFIG["output_dir"], exist_ok=True)
 # Dataset Loader
 # ======================
 class ImageMetadataDataset(Dataset):
-    def __init__(self, npz_path, transform=None, train=True):
-        data = np.load(npz_path)
-        self.images = data["images"]
-        self.metadata = data.get("metadata", np.zeros((len(data["images"]), 16), dtype=np.float32))
-        self.labels = data["labels"].astype(np.int64)  # Ensure integer labels for CrossEntropyLoss
+    def __init__(self, npz_path, transform=None, train=True, seed=42):
+        data = np.load(npz_path, allow_pickle=True)
+        images = data["images"]
+        metadata = data["metadata"] if "metadata" in data.files else np.zeros((len(images), 16), dtype=np.float32)
+        labels = data["labels"].astype(np.int64)
+        self.class_names = (
+            [str(x) for x in data["class_names"].tolist()]
+            if "class_names" in data.files
+            else None
+        )
         self.transform = transform
-        
-        # Train/val split
-        split_idx = int(0.8 * len(self.images))
-        if train:
-            self.images = self.images[:split_idx]
-            self.metadata = self.metadata[:split_idx]
-            self.labels = self.labels[:split_idx]
-        else:
-            self.images = self.images[split_idx:]
-            self.metadata = self.metadata[split_idx:]
-            self.labels = self.labels[split_idx:]
+
+        # Stratified split so a class-concatenated NPZ cannot leak last classes into val-only.
+        indices = np.arange(len(labels))
+        train_idx, val_idx = train_test_split(
+            indices, test_size=0.2, random_state=seed, stratify=labels
+        )
+        keep = train_idx if train else val_idx
+        self.images = images[keep]
+        self.metadata = metadata[keep]
+        self.labels = labels[keep]
 
     def __len__(self):
         return len(self.images)
@@ -189,34 +201,48 @@ def train_model(model_name, config):
     logger.info(f"Using device: {device}")
 
     data_path = config["models"][model_name]["data_path"]
-    num_classes = config["models"][model_name]["num_classes"]
 
     # Check if data exists
     if not os.path.exists(data_path):
         logger.warning(f"Dataset not found: {data_path}. Skipping {model_name} training.")
         return None, None
 
+    seed = config["training"].get("seed", 42)
     # Create datasets
-    train_dataset = ImageMetadataDataset(data_path, transform=train_transform, train=True)
-    val_dataset = ImageMetadataDataset(data_path, transform=val_transform, train=False)
-    
-    train_loader = DataLoader(train_dataset, batch_size=config["training"]["batch_size"], shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_dataset, batch_size=config["training"]["batch_size"], shuffle=False, num_workers=2)
+    train_dataset = ImageMetadataDataset(data_path, transform=train_transform, train=True, seed=seed)
+    val_dataset = ImageMetadataDataset(data_path, transform=val_transform, train=False, seed=seed)
+    num_classes = int(max(train_dataset.labels.max(), val_dataset.labels.max()) + 1)
+    logger.info(
+        f"{model_name}: {len(train_dataset)} train / {len(val_dataset)} val images, {num_classes} classes"
+    )
+
+    workers = config["training"].get("num_workers", 0)
+    train_loader = DataLoader(
+        train_dataset, batch_size=config["training"]["batch_size"], shuffle=True, num_workers=workers
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=config["training"]["batch_size"], shuffle=False, num_workers=workers
+    )
 
     # Create model
     model = FusionModel(num_classes=num_classes, dropout_rate=config["training"]["dropout_rate"]).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=config["training"]["learning_rate"], weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 
     # Initialize AMP scaler if using mixed precision
     scaler = GradScaler() if config["training"]["use_amp"] and device.type == 'cuda' else None
 
-    # TensorBoard logging
-    writer = SummaryWriter(log_dir=f"{config['output_dir']}/logs_{model_name}")
-    
+    # TensorBoard logging (optional)
+    log_dir = Path(config["output_dir"]) / f"logs_{model_name}"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    writer = SummaryWriter(log_dir=str(log_dir)) if SummaryWriter is not None else None
+    csv_path = Path(config["output_dir"]) / f"metrics_{model_name}.csv"
+    history = []
+
     # Training loop
     best_val_loss = float("inf")
+    best_val_acc = 0.0
     patience_counter = 0
     checkpoint_path = Path(config["output_dir"]) / f"best_model_{model_name}.pth"
 
@@ -289,11 +315,22 @@ def train_model(model_name, config):
         scheduler.step(val_loss)
 
         # Log to TensorBoard
-        writer.add_scalar("Loss/Train", train_loss, epoch)
-        writer.add_scalar("Loss/Validation", val_loss, epoch)
-        writer.add_scalar("Accuracy/Train", train_acc, epoch)
-        writer.add_scalar("Accuracy/Validation", val_acc, epoch)
-        writer.add_scalar("Learning_Rate", optimizer.param_groups[0]['lr'], epoch)
+        if writer is not None:
+            writer.add_scalar("Loss/Train", train_loss, epoch)
+            writer.add_scalar("Loss/Validation", val_loss, epoch)
+            writer.add_scalar("Accuracy/Train", train_acc, epoch)
+            writer.add_scalar("Accuracy/Validation", val_acc, epoch)
+            writer.add_scalar("Learning_Rate", optimizer.param_groups[0]['lr'], epoch)
+
+        row = {
+            "epoch": epoch + 1,
+            "train_loss": train_loss,
+            "train_acc": train_acc,
+            "val_loss": val_loss,
+            "val_acc": val_acc,
+            "lr": optimizer.param_groups[0]["lr"],
+        }
+        history.append(row)
 
         logger.info(f"[{model_name}] Epoch {epoch+1}/{config['training']['epochs']} - "
                    f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}% - "
@@ -302,6 +339,7 @@ def train_model(model_name, config):
         # Save best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            best_val_acc = val_acc
             patience_counter = 0
             torch.save({
                 'epoch': epoch,
@@ -309,7 +347,9 @@ def train_model(model_name, config):
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_loss': val_loss,
                 'val_acc': val_acc,
-                'num_classes': num_classes
+                'num_classes': num_classes,
+                'class_names': train_dataset.class_names,
+                'data_path': data_path,
             }, checkpoint_path)
             logger.info(f"Saved best model checkpoint to {checkpoint_path}")
         else:
@@ -347,7 +387,14 @@ def train_model(model_name, config):
         logger.error(f"Failed to export {model_name} to ONNX: {e}")
         onnx_path = None
 
-    writer.close()
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer_csv = csv.DictWriter(f, fieldnames=history[0].keys())
+        writer_csv.writeheader()
+        writer_csv.writerows(history)
+    logger.info(f"Wrote per-epoch metrics to {csv_path}")
+
+    if writer is not None:
+        writer.close()
     return checkpoint_path, onnx_path
 
 # ======================
