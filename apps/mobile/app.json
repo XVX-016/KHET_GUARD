@@ -16,6 +16,10 @@
       },
       "googleServicesFile": "./android/app/google-services.json"
     },
+    "web": {
+      "bundler": "metro",
+      "output": "single"
+    },
     "extra": {
       "eas": { "projectId": "CHANGE_ME" }
     }

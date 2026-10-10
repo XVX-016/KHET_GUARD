@@ -149,11 +149,10 @@ class FusionModel(nn.Module):
             nn.Linear(128, num_classes)
         )
 
-        # Grad-CAM hooks
+        # Grad-CAM is attached on demand in generate_gradcam / generate_fusion_results.py.
+        # Persistent hooks here fight with full-backward-hook Grad-CAM and slow training.
         self.gradients = None
         self.activation = None
-        self.backbone.features[-1].register_forward_hook(self._save_activation)
-        self.backbone.features[-1].register_backward_hook(self._save_gradient)
 
     def forward(self, image, metadata):
         x_img = self.backbone(image)
@@ -162,35 +161,36 @@ class FusionModel(nn.Module):
         out = self.classifier(x)
         return out
 
-    # Grad-CAM hooks
-    def _save_activation(self, module, input, output):
-        self.activation = output
-
-    def _save_gradient(self, module, grad_input, grad_output):
-        self.gradients = grad_output[0]
-
     def generate_gradcam(self, image, metadata, class_idx=None):
-        """Generate Grad-CAM visualization"""
-        if self.activation is None or self.gradients is None:
-            raise ValueError("Grad-CAM not available. Run forward pass first.")
-        
-        # Get gradients for the target class
-        if class_idx is None:
-            class_idx = torch.argmax(self.forward(image, metadata), dim=1)
-        
-        # Global average pooling of gradients
-        pooled_grads = torch.mean(self.gradients, dim=[0, 2, 3])
-        
-        # Weight the feature maps
-        for i in range(self.activation.size(1)):
-            self.activation[:, i, :, :] *= pooled_grads[i]
-        
-        # Generate heatmap
-        heatmap = torch.mean(self.activation, dim=1).squeeze()
-        heatmap = torch.relu(heatmap)
-        heatmap = heatmap / torch.max(heatmap)
-        
-        return heatmap.cpu().numpy()
+        """Generate a Grad-CAM heatmap for a single (image, metadata) batch."""
+        activations = {}
+        gradients = {}
+        target = self.backbone.features[-1]
+
+        def on_forward(module, inp, out):
+            activations["value"] = out
+
+        def on_backward(module, grad_in, grad_out):
+            gradients["value"] = grad_out[0]
+
+        fh = target.register_forward_hook(on_forward)
+        bh = target.register_full_backward_hook(on_backward)
+        try:
+            self.zero_grad(set_to_none=True)
+            logits = self.forward(image, metadata)
+            if class_idx is None:
+                class_idx = int(torch.argmax(logits, dim=1)[0].item())
+            logits[0, class_idx].backward()
+            grads = gradients["value"]
+            acts = activations["value"]
+            weights = grads.mean(dim=(2, 3), keepdim=True)
+            heatmap = torch.relu((weights * acts).sum(dim=1).squeeze())
+            heatmap = heatmap - heatmap.min()
+            heatmap = heatmap / (heatmap.max() + 1e-8)
+            return heatmap.detach().cpu().numpy()
+        finally:
+            fh.remove()
+            bh.remove()
 
 # ======================
 # Training Function
@@ -351,6 +351,11 @@ def train_model(model_name, config):
                 'class_names': train_dataset.class_names,
                 'data_path': data_path,
             }, checkpoint_path)
+            if train_dataset.class_names:
+                labels_path = Path(config["output_dir"]) / f"{model_name}_labels.json"
+                labels_path.write_text(
+                    json.dumps(train_dataset.class_names, indent=2), encoding="utf-8"
+                )
             logger.info(f"Saved best model checkpoint to {checkpoint_path}")
         else:
             patience_counter += 1

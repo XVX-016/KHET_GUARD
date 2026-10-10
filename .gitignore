@@ -19,15 +19,17 @@ ENV/
 # Notebooks checkpoints
 .ipynb_checkpoints/
 
-# Data and datasets
+# Datasets & Scratch
 /data/
+arch3_rtdetr/data/
+scratch/
 ml/datasets/
 ml/Indian_bovine_breeds/
 ml/Pest_Dataset/
 ml/plantvillage dataset/
 ml/artifacts/
 
-# Model exports and large artifacts
+# Large Model Checkpoints & Downloads
 model/exports/
 *.npz
 *.npy
@@ -54,6 +56,7 @@ model/exports/
 logs/
 **/logs_*/
 **/runs/
+runs/
 **/wandb/
 **/tensorboard/
 *.v2
