@@ -1,8 +1,8 @@
 """
-Generate Architectural Comparison Charts for Khet Guard Report
-----------------------------------------------------------------
+Generate Architectural Comparison Charts for Khet Guard Report (Corrected & Refined)
+--------------------------------------------------------------------------------------
 1. model_comparison_metrics.png: Grouped bar chart comparing Primary Metric & Macro-F1.
-2. accuracy_vs_latency_tradeoff.png: Scatter plot of Accuracy/mAP vs. GPU Latency with parameter bubbles.
+2. accuracy_vs_latency_tradeoff.png: Scatter plot of Accuracy/mAP vs. GPU Latency with resolution & param labels.
 
 Output directory: model/exports/model_comparison_charts/
 """
@@ -20,7 +20,7 @@ plt.rcParams["font.size"] = 10
 out_dir = Path("model/exports/model_comparison_charts")
 out_dir.mkdir(parents=True, exist_ok=True)
 
-# Data from live benchmarks & evaluation metrics
+# Data from rigorous synchronized benchmarks
 architectures = ["Arch 1\n(EfficientNet-B4)", "Arch 2\n(Swin-B Transformer)", "Arch 3\n(RT-DETR Detector)"]
 
 # Primary Metrics (Accuracy % for Arch 1 & 2; mAP50 % for Arch 3)
@@ -31,13 +31,13 @@ primary_labels = ["97.2% Acc", "98.8% Acc", "47.6% mAP50"]
 macro_f1 = [0.9712, 0.9881, 0.0]  # 0.0 for Arch 3 (N/A)
 f1_labels = ["0.971 F1", "0.988 F1", "N/A (Detection)"]
 
-# Latency (GPU ms) & Parameters (M)
-gpu_latencies = [54.80, 78.90, 104.07]  # ms
-param_counts = [18.06, 91.28, 32.97]    # Millions
+# Rigorous GPU Pure Model Latencies (ms) & Resolution/Params
+gpu_latencies = [26.15, 35.34, 37.81]  # Pure GPU forward pass (ms)
+param_counts = [18.06, 91.28, 32.97]   # Millions
+resolutions = ["224x224", "224x224", "640x640"]
 
 # Colors matching project palette
 purple_dark = "#4a148c"
-purple_light = "#7b1fa2"
 teal_accent = "#00897b"
 amber_accent = "#f57c00"
 
@@ -94,43 +94,43 @@ print(f"[OK] Saved Chart 1: {chart1_path}")
 
 
 # ==============================================================================
-# Chart 2: Accuracy / Primary Metric vs. GPU Latency Scatter Plot
+# Chart 2: Accuracy / Primary Metric vs. GPU Latency Scatter Plot (Framed with Resolution Context)
 # ==============================================================================
 fig, ax = plt.subplots(figsize=(10, 6), dpi=200)
 
 colors = [purple_dark, "#00695c", amber_accent]
 markers = ["o", "s", "^"]
-bubble_sizes = [p * 15 for p in param_counts]  # Size proportional to params
+bubble_sizes = [p * 15 for p in param_counts]
 
-for i, (lat, met, name, params, c, m, size) in enumerate(zip(gpu_latencies, primary_metrics, architectures, param_counts, colors, markers, bubble_sizes)):
-    ax.scatter(lat, met, s=size, color=c, alpha=0.7, edgecolors="black", linewidth=1.5, label=f"{name.splitlines()[0]} ({params:.1f}M params)", zorder=3)
+for i, (lat, met, name, params, res, c, m, size) in enumerate(zip(gpu_latencies, primary_metrics, architectures, param_counts, resolutions, colors, markers, bubble_sizes)):
+    ax.scatter(lat, met, s=size, color=c, alpha=0.75, edgecolors="black", linewidth=1.5, label=f"{name.splitlines()[0]} ({res}, {params:.1f}M params)", zorder=3)
     
     # Label placement offsets
-    offset_y = 3 if i != 2 else -7
-    offset_x = 2 if i == 0 else (-12 if i == 1 else 2)
+    offset_y = 3 if i != 2 else -8
+    offset_x = -3 if i == 0 else (-12 if i == 1 else 2)
     
     ax.annotate(
-        f"{name.replace(chr(10), ' ')}\n({met:.1f}%, {lat:.1f} ms)",
+        f"{name.replace(chr(10), ' ')}\n[{res} input]\n({met:.1f}%, {lat:.1f} ms)",
         xy=(lat, met),
         xytext=(lat + offset_x, met + offset_y),
-        fontsize=9,
+        fontsize=8.5,
         fontweight="bold",
         color=c,
         bbox=dict(boxstyle="round,pad=0.3", fc="white", ec=c, lw=1, alpha=0.9),
         arrowprops=dict(arrowstyle="->", connectionstyle="arc3,rad=0.2", color=c, lw=1.2)
     )
 
-ax.set_xlabel("GPU Inference Latency (ms / image)", fontsize=11, fontweight="bold")
+ax.set_xlabel("Pure GPU Model Forward Pass Latency (ms / image)", fontsize=11, fontweight="bold")
 ax.set_ylabel("Primary Metric (Accuracy / mAP50 %)", fontsize=11, fontweight="bold")
-ax.set_title("Khet Guard Accuracy vs. Latency Pareto Trade-Off", fontsize=14, fontweight="bold", pad=15)
+ax.set_title("Khet Guard Accuracy vs. GPU Latency Trade-Off (With Resolution Context)", fontsize=13, fontweight="bold", pad=15)
 
-ax.set_xlim(40, 120)
+ax.set_xlim(20, 50)
 ax.set_ylim(40, 105)
 ax.grid(True, linestyle="--", alpha=0.5)
 
-# Annotation box explaining Pareto frontier
-ax.text(0.03, 0.05, "Bubble size = Parameter Count\nUpper-Left = Ideal (Fast & Accurate)",
-        transform=ax.transAxes, fontsize=9, bbox=dict(boxstyle="round", fc="#f5f5f5", ec="#cccccc"))
+# Annotation box explaining resolution difference
+ax.text(0.03, 0.05, "Bubble size = Parameter Count\n*Note: Arch 3 operates at 640x640 (8.2x pixel resolution)\nLatency is not directly comparable across tasks.",
+        transform=ax.transAxes, fontsize=8.5, bbox=dict(boxstyle="round", fc="#fffde7", ec="#fbc02d", lw=1))
 
 ax.legend(loc="upper right", frameon=True, facecolor="white")
 
