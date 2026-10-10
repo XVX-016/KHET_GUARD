@@ -1,0 +1,19 @@
+{
+  "architecture": "arch3_rtdetr_plantdoc_finetuned",
+  "dataset": "PlantDoc",
+  "checkpoint": "model/exports/arch3/results/weights/best.pt",
+  "mAP50": 0.4756565058187123,
+  "mAP50-95": 0.3776712867046293,
+  "precision": 0.5263263053361861,
+  "recall": 0.537873152879812,
+  "total_raw_boxes_eval": 2317,
+  "clean_nms_boxes_eval": 432,
+  "suppressed_redundant_boxes_pct": 81.36,
+  "sample_labels": [
+    "Tomato mold leaf",
+    "grape leaf",
+    "Raspberry leaf",
+    "Bell_pepper leaf",
+    "Corn rust leaf"
+  ]
+}

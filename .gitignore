@@ -30,7 +30,6 @@ ml/plantvillage dataset/
 ml/artifacts/
 
 # Large Model Checkpoints & Downloads
-model/exports/
 *.npz
 *.npy
 *.pt
@@ -43,6 +42,13 @@ model/exports/
 *.keras
 *.ckpt
 *.pb
+model/exports/**/*.pth
+model/exports/**/*.pt
+model/exports/**/*.onnx
+model/exports/**/*.npz
+model/exports/**/weights/
+model/exports/**/labels/
+model/exports/**/images/
 *.bin
 *.tar
 *.tar.gz
