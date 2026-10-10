@@ -1,0 +1,17 @@
+# Architecture 3 (RT-DETR Plant Disease Object Detection) Dependencies
+# Separate from root requirements.txt to avoid altering existing Arch 1 & Arch 2 pipeline.
+
+# Core Object Detection Framework
+ultralytics>=8.1.0
+
+# Hugging Face Datasets for loading PlantDoc dataset
+datasets>=2.16.0
+
+# Computer Vision & Image Utility
+opencv-python>=4.8.0
+pillow>=9.5.0
+matplotlib>=3.7.0
+
+# Deep Learning Framework (Matches root project torch/torchvision environment)
+# Note: Ensure torch >= 2.0.0 and torchvision >= 0.15.0 for RT-DETR model support.
+# No version conflict found with existing torch/torchvision installation.

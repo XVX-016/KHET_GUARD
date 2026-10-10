@@ -1,0 +1,14 @@
+{
+  "disease": {
+    "checkpoint": "model\\exports\\best_model_disease.pth",
+    "onnx": "model\\exports\\disease_model.onnx"
+  },
+  "pest": {
+    "checkpoint": null,
+    "onnx": null
+  },
+  "cattle": {
+    "checkpoint": null,
+    "onnx": null
+  }
+}

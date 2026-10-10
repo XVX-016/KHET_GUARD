@@ -90,23 +90,55 @@ def load_pesticide_map(map_path: str) -> Dict:
     logger.info(f"Loaded pesticide map with {len(pesticide_map)} entries")
     return pesticide_map
 
-def preprocess_image(image: Image.Image, target_size: Tuple[int, int] = (380, 380)) -> np.ndarray:
-    """Preprocess image for model inference"""
-    # Convert to RGB if needed
-    if image.mode != 'RGB':
-        image = image.convert('RGB')
-    
-    # Resize image
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 3, 1, 1)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 3, 1, 1)
+
+
+def _first_existing(*paths: Optional[str]) -> Optional[str]:
+    for path in paths:
+        if path and os.path.exists(path):
+            return path
+    return None
+
+
+def _spatial_size_from_onnx(session: ort.InferenceSession) -> Tuple[int, int]:
+    for inp in session.get_inputs():
+        shape = inp.shape
+        if len(shape) == 4 and all(isinstance(d, int) for d in shape[2:]):
+            return int(shape[3]), int(shape[2])  # (W, H) for PIL
+    return (224, 224)
+
+
+def preprocess_image(
+    image: Image.Image,
+    target_size: Tuple[int, int] = (224, 224),
+    imagenet: bool = True,
+) -> np.ndarray:
+    """Preprocess image for fusion ONNX (CHW, ImageNet-normalized)."""
+    if image.mode != "RGB":
+        image = image.convert("RGB")
     image = image.resize(target_size, Image.Resampling.LANCZOS)
-    
-    # Convert to numpy array and normalize
     img_array = np.array(image, dtype=np.float32) / 255.0
-    
-    # Transpose to CHW format and add batch dimension
     img_array = np.transpose(img_array, (2, 0, 1))
     img_array = np.expand_dims(img_array, axis=0)
-    
-    return img_array
+    if imagenet:
+        img_array = (img_array - IMAGENET_MEAN) / IMAGENET_STD
+    return img_array.astype(np.float32)
+
+
+def run_onnx(session: ort.InferenceSession, image_nchw: np.ndarray) -> np.ndarray:
+    """Run a 1-input image model or the fusion (image, metadata) export."""
+    feeds: Dict[str, np.ndarray] = {}
+    for inp in session.get_inputs():
+        shape = list(inp.shape)
+        if len(shape) == 4:
+            feeds[inp.name] = image_nchw
+        elif len(shape) == 2:
+            dim = int(shape[1]) if isinstance(shape[1], int) else 16
+            feeds[inp.name] = np.zeros((image_nchw.shape[0], dim), dtype=np.float32)
+        else:
+            raise ValueError(f"Unsupported ONNX input '{inp.name}' with shape {shape}")
+    return session.run([session.get_outputs()[0].name], feeds)[0]
 
 def postprocess_predictions(logits: np.ndarray, labels: List[str]) -> Tuple[str, float, int, List[Dict[str, float]]]:
     """Postprocess model predictions"""
@@ -218,26 +250,45 @@ async def startup_event():
     global disease_model, cattle_model, disease_labels, cattle_labels, pesticide_map
     
     try:
-        # Load models
-        disease_model_path = os.getenv("DISEASE_MODEL", "ml/artifacts/disease_pest/exports/model.onnx")
-        cattle_model_path = os.getenv("CATTLE_MODEL", "ml/artifacts/cattle/exports/model.onnx")
-        
+        disease_model_path = _first_existing(
+            os.getenv("DISEASE_MODEL"),
+            "model/exports/disease_model.onnx",
+            "ml/artifacts/disease_pest/exports/model.onnx",
+        )
+        cattle_model_path = _first_existing(
+            os.getenv("CATTLE_MODEL"),
+            "model/exports/cattle_model.onnx",
+            "ml/artifacts/cattle/exports/model.onnx",
+        )
+
+        if not disease_model_path:
+            raise FileNotFoundError("Disease ONNX model not found")
         disease_model = load_model(disease_model_path)
-        cattle_model = load_model(cattle_model_path)
-        
-        # Load labels
-        disease_labels_path = os.getenv("DISEASE_LABELS", "ml/artifacts/disease_pest/labels.json")
-        cattle_labels_path = os.getenv("CATTLE_LABELS", "ml/artifacts/cattle/labels.json")
-        
+        if cattle_model_path:
+            cattle_model = load_model(cattle_model_path)
+        else:
+            logger.warning("Cattle model not found; /predict/cattle will be unavailable")
+
+        disease_labels_path = _first_existing(
+            os.getenv("DISEASE_LABELS"),
+            "model/exports/disease_labels.json",
+            "ml/artifacts/disease_pest/labels.json",
+        )
+        cattle_labels_path = _first_existing(
+            os.getenv("CATTLE_LABELS"),
+            "model/exports/cattle_labels.json",
+            "ml/artifacts/cattle/labels.json",
+        )
+        if not disease_labels_path:
+            raise FileNotFoundError("Disease labels JSON not found")
         disease_labels = load_labels(disease_labels_path)
-        cattle_labels = load_labels(cattle_labels_path)
-        
-        # Load pesticide map
+        cattle_labels = load_labels(cattle_labels_path) if cattle_labels_path else []
+
         pesticide_map_path = os.getenv("PESTICIDE_MAP", "ml/recommender/pesticide_map.json")
         pesticide_map = load_pesticide_map(pesticide_map_path)
-        
-        logger.info("All models and labels loaded successfully!")
-        
+
+        logger.info("Models and labels loaded (cattle optional).")
+
     except Exception as e:
         logger.error(f"Error during startup: {e}")
         raise
@@ -270,12 +321,8 @@ async def predict_disease_pest(
         # Read and preprocess image
         image_data = await file.read()
         image = Image.open(io.BytesIO(image_data))
-        processed_image = preprocess_image(image)
-        
-        # Run inference
-        input_name = disease_model.get_inputs()[0].name
-        output_name = disease_model.get_outputs()[0].name
-        logits = disease_model.run([output_name], {input_name: processed_image})[0]
+        processed_image = preprocess_image(image, target_size=_spatial_size_from_onnx(disease_model))
+        logits = run_onnx(disease_model, processed_image)
         
         # Postprocess predictions
         class_name, confidence, class_id, all_predictions = postprocess_predictions(logits, disease_labels)
@@ -313,12 +360,8 @@ async def predict_cattle(file: UploadFile = File(...)):
         # Read and preprocess image
         image_data = await file.read()
         image = Image.open(io.BytesIO(image_data))
-        processed_image = preprocess_image(image)
-        
-        # Run inference
-        input_name = cattle_model.get_inputs()[0].name
-        output_name = cattle_model.get_outputs()[0].name
-        logits = cattle_model.run([output_name], {input_name: processed_image})[0]
+        processed_image = preprocess_image(image, target_size=_spatial_size_from_onnx(cattle_model))
+        logits = run_onnx(cattle_model, processed_image)
         
         # Postprocess predictions
         class_name, confidence, class_id, all_predictions = postprocess_predictions(logits, cattle_labels)
@@ -397,8 +440,23 @@ async def ui_page():
     .row { display:flex; gap:16px; flex-wrap: wrap; }
     input[type=file], input[type=text] { width:100%; padding:10px; background: var(--bg); color: var(--text); border:1px solid #1f2937; border-radius:10px; }
     button.primary { background: var(--accent); border:0; color:#fff; padding:10px 14px; border-radius:10px; cursor:pointer; }
-    img.preview { max-width: 100%; border-radius:12px; border:1px solid #1f2937; }
-    pre { white-space: pre-wrap; word-break: break-word; background: var(--bg); padding: 12px; border-radius: 12px; border: 1px solid #1f2937; }
+    img.preview { max-width: 100%; border-radius:12px; border:1px solid #1f2937; display:none; }
+    img.preview.show { display:block; }
+    .result { background: var(--bg); padding: 14px; border-radius: 12px; border: 1px solid #1f2937; min-height: 64px; }
+    .result .empty { color: var(--muted); }
+    .result .empty.error { color: #f87171; }
+    .verdict .badge { display:inline-block; font-size:11px; font-weight:700; letter-spacing:.04em; text-transform:uppercase; color:#16a34a; background:rgba(22,163,74,.12); padding:4px 8px; border-radius:999px; }
+    .verdict .name { font-size:20px; font-weight:800; margin:8px 0 10px; }
+    .conf-row, .alt-row { display:flex; justify-content:space-between; align-items:center; font-size:13px; color: var(--muted); margin-bottom:6px; }
+    .conf-row strong { color: var(--text); font-size:16px; }
+    .bar { height:8px; background:#1f2937; border-radius:999px; overflow:hidden; }
+    .bar i { display:block; height:100%; background: linear-gradient(90deg, #16a34a, #22c55e); border-radius:999px; }
+    .meta { margin-top:14px; display:grid; gap:8px; }
+    .meta div { display:flex; gap:10px; font-size:13px; line-height:1.4; }
+    .meta .k { flex:0 0 88px; color: var(--muted); font-weight:600; }
+    .alts { margin-top:14px; }
+    .alts-title { font-size:12px; font-weight:700; color: var(--muted); text-transform:uppercase; letter-spacing:.04em; margin-bottom:8px; }
+    .alt { margin-bottom:8px; }
     .tabs { position: sticky; bottom: 0; left: 0; right: 0; display:flex; gap: 10px; justify-content: space-around; padding: 10px 12px; background: rgba(15,23,42,.85); backdrop-filter: blur(6px); border-top:1px solid #1f2937; }
     .tab { color: var(--text); text-decoration: none; font-weight: 600; padding:8px 12px; border-radius: 12px; background: rgba(255,255,255,.04); }
     .muted { color: var(--muted); }
@@ -407,6 +465,88 @@ async def ui_page():
     function setTheme(mode){ document.documentElement.setAttribute('data-theme', mode); localStorage.setItem('kg_theme', mode); }
     function toggleTheme(){ const cur = localStorage.getItem('kg_theme') || 'dark'; setTheme(cur==='dark'?'light':'dark'); }
     (function(){ const saved = localStorage.getItem('kg_theme'); if(saved){ setTheme(saved); }})();
+    function esc(s){
+      return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){
+        return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]);
+      });
+    }
+    function prettyName(name){
+      if (!name) return 'Unknown';
+      return String(name).replace(/___/g, ' — ').replace(/_/g, ' ');
+    }
+    function pct(n){ return Math.round((Number(n) || 0) * 1000) / 10; }
+    function bar(v){
+      var w = Math.max(0, Math.min(100, v));
+      return '<div class="bar"><i style="width:' + w + '%"></i></div>';
+    }
+    function setStatus(el, html, isError){
+      el.innerHTML = '<div class="empty' + (isError ? ' error' : '') + '">' + html + '</div>';
+    }
+    function renderPrediction(el, data, kind){
+      if (!data || data.detail) {
+        setStatus(el, esc(data && data.detail ? data.detail : 'No result'), true);
+        return;
+      }
+      var conf = pct(data.confidence);
+      var others = (data.all_predictions || []).slice(1, 4);
+      var extra = '';
+      if (kind === 'disease' && data.pesticide_recommendation) {
+        var p = data.pesticide_recommendation;
+        var recs = Array.isArray(p.recommended) ? p.recommended.join(', ') : (p.recommended || '');
+        extra = '<div class="meta">'
+          + '<div><span class="k">Treatment</span><span>' + esc(recs) + '</span></div>'
+          + (p.dosage ? '<div><span class="k">Dosage</span><span>' + esc(p.dosage) + '</span></div>' : '')
+          + (p.safety ? '<div><span class="k">Safety</span><span>' + esc(p.safety) + '</span></div>' : '')
+          + '</div>';
+      }
+      if (kind === 'cattle' && data.breed_info) {
+        var b = data.breed_info;
+        extra = '<div class="meta">'
+          + (b.origin ? '<div><span class="k">Origin</span><span>' + esc(b.origin) + '</span></div>' : '')
+          + (b.milk_yield ? '<div><span class="k">Milk yield</span><span>' + esc(b.milk_yield) + '</span></div>' : '')
+          + (b.characteristics ? '<div><span class="k">Traits</span><span>' + esc(b.characteristics) + '</span></div>' : '')
+          + '</div>';
+      }
+      var alt = others.map(function(p){
+        var c = pct(p.confidence);
+        return '<div class="alt"><div class="alt-row"><span>' + esc(prettyName(p.class)) + '</span><span>' + c + '%</span></div>' + bar(c) + '</div>';
+      }).join('');
+      el.innerHTML = '<div class="verdict">'
+        + '<div class="badge">' + (kind === 'disease' ? 'Diagnosis' : 'Breed') + '</div>'
+        + '<div class="name">' + esc(prettyName(data.class_name)) + '</div>'
+        + '<div class="conf-row"><span>Confidence</span><strong>' + conf + '%</strong></div>'
+        + bar(conf)
+        + '</div>'
+        + extra
+        + (alt ? '<div class="alts"><div class="alts-title">Other possibilities</div>' + alt + '</div>' : '');
+    }
+    function renderCrop(el, data){
+      if (!data || data.detail) {
+        setStatus(el, esc(data && data.detail ? data.detail : 'No recommendation yet'), true);
+        return;
+      }
+      var crops = data.recommendations || data.crops || data.suggested_crops || [];
+      if (!Array.isArray(crops) && data.crop) crops = [data];
+      if (!crops.length) {
+        var name = data.crop || data.class_name || data.name;
+        if (name) crops = [data];
+      }
+      if (!crops.length) {
+        setStatus(el, 'No crop suggestions for these coordinates.');
+        return;
+      }
+      el.innerHTML = crops.slice(0, 5).map(function(c, i){
+        var title = prettyName(c.crop || c.name || c.class_name || ('Suggestion ' + (i+1)));
+        var score = c.score != null ? pct(c.score > 1 ? c.score/100 : c.score) : (c.confidence != null ? pct(c.confidence) : null);
+        var why = c.reason || c.note || c.description || '';
+        return '<div class="verdict" style="margin-bottom:12px">'
+          + '<div class="badge">Suggested crop</div>'
+          + '<div class="name">' + esc(title) + '</div>'
+          + (score != null ? '<div class="conf-row"><span>Fit</span><strong>' + score + '%</strong></div>' + bar(score) : '')
+          + (why ? '<div class="meta"><div><span class="k">Why</span><span>' + esc(why) + '</span></div></div>' : '')
+          + '</div>';
+      }).join('');
+    }
     async function predict(endpointId) {
       const fileInput = document.getElementById(endpointId + '-file');
       const resultEl = document.getElementById(endpointId + '-result');
@@ -414,29 +554,31 @@ async def ui_page():
       if (!fileInput.files.length) { alert('Choose an image first'); return; }
       const file = fileInput.files[0];
       previewEl.src = URL.createObjectURL(file);
+      previewEl.classList.add('show');
       const form = new FormData();
       form.append('file', file);
       try {
-        resultEl.textContent = 'Running inference...';
+        setStatus(resultEl, 'Running inference...');
         const res = await fetch('/predict/' + (endpointId === 'disease' ? 'disease_pest' : 'cattle'), { method: 'POST', body: form });
-        if (!res.ok) { throw new Error('HTTP ' + res.status); }
-        const data = await res.json();
-        resultEl.textContent = JSON.stringify(data, null, 2);
+        const data = await res.json().catch(function(){ return {}; });
+        if (!res.ok) { throw new Error(data.detail || ('HTTP ' + res.status)); }
+        renderPrediction(resultEl, data, endpointId);
       } catch (e) {
-        resultEl.textContent = 'Error: ' + e.message;
+        setStatus(resultEl, esc('Could not analyze this image. ' + e.message), true);
       }
     }
     async function recommendCrop(){
       const lat = document.getElementById('crop-lat').value.trim();
       const lon = document.getElementById('crop-lon').value.trim();
       const out = document.getElementById('crop-result');
-      if(!lat || !lon){ out.textContent = 'Enter latitude and longitude'; return; }
+      if(!lat || !lon){ setStatus(out, 'Enter latitude and longitude'); return; }
       try{
-        out.textContent = 'Fetching recommendation...';
+        setStatus(out, 'Fetching recommendation...');
         const res = await fetch('/recommend/crop', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ latitude: parseFloat(lat), longitude: parseFloat(lon) })});
-        if(!res.ok) throw new Error('HTTP ' + res.status);
-        out.textContent = JSON.stringify(await res.json(), null, 2);
-      }catch(e){ out.textContent = 'Error: ' + e.message; }
+        const data = await res.json().catch(function(){ return {}; });
+        if(!res.ok) throw new Error(data.detail || ('HTTP ' + res.status));
+        renderCrop(out, data);
+      }catch(e){ setStatus(out, esc('Crop recommendation is not available yet. ' + e.message), true); }
     }
   </script>
   </head>
@@ -483,14 +625,14 @@ async def ui_page():
         <input id=\"disease-file\" type=\"file\" accept=\"image/*\" onchange=\"predict('disease')\">\n
         <div style=\"margin-top:12px\"><img class=\"preview\" id=\"disease-preview\" alt=\"preview\"></div>
         <h4>Result</h4>
-        <pre id=\"disease-result\"></pre>
+        <div class=\"result\" id=\"disease-result\"><div class=\"empty\">Upload a leaf photo to see the diagnosis</div></div>
       </div>
       <div style=\"flex:1 1 320px\"> 
         <h3>Cattle Breed</h3>
         <input id=\"cattle-file\" type=\"file\" accept=\"image/*\" onchange=\"predict('cattle')\">\n
         <div style=\"margin-top:12px\"><img class=\"preview\" id=\"cattle-preview\" alt=\"preview\"></div>
         <h4>Result</h4>
-        <pre id=\"cattle-result\"></pre>
+        <div class=\"result\" id=\"cattle-result\"><div class=\"empty\">Upload a cattle photo to see the breed</div></div>
       </div>
     </div>
   </div>
@@ -502,7 +644,7 @@ async def ui_page():
       <input id=\"crop-lon\" type=\"text\" placeholder=\"Longitude\" style=\"flex:1 1 160px\">
       <button class=\"primary\" onclick=\"recommendCrop()\">Recommend</button>
     </div>
-    <pre id=\"crop-result\" class=\"muted\">Enter coordinates and click Recommend</pre>
+    <div class=\"result\" id=\"crop-result\"><div class=\"empty\">Enter coordinates and click Recommend</div></div>
   </div>
 
   <script>
