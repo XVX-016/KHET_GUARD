@@ -1,0 +1,8 @@
+{
+  "checkpoint": "model/exports/arch2/best_model_disease.pth",
+  "val_accuracy": 0.9882903981264637,
+  "n_val": 427,
+  "ckpt_val_acc": 98.82903981264637,
+  "ckpt_val_loss": 0.03658732510585752,
+  "ckpt_epoch": 4
+}

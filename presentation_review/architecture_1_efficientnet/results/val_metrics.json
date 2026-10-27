@@ -1,0 +1,8 @@
+{
+  "checkpoint": "model/exports/best_model_disease.pth",
+  "val_accuracy": 0.9718969555035128,
+  "n_val": 427,
+  "ckpt_val_acc": 97.18969555035129,
+  "ckpt_val_loss": 0.07128280014903457,
+  "ckpt_epoch": 5
+}
